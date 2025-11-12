@@ -1,0 +1,394 @@
+import numpy as np
+import pandas as pd
+import wfdb
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GATConv, global_mean_pool, SAGPooling
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.utils import resample
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.fft import fft
+from scipy.signal import find_peaks
+import pywt
+import os
+from tqdm import tqdm
+from torch.cuda.amp import GradScaler, autocast
+
+# Step 1: Install Dependencies (Run in Kaggle)
+"""
+!pip uninstall -y torch torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric
+!pip install torch==2.1.0
+!pip install torch-geometric
+!pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.1.0+cu117.html
+!pip install numpy pandas scikit-learn matplotlib seaborn tqdm wfdb pywavelets
+"""
+
+# Step 2: Load and Balance PTB-XL Dataset
+def load_and_balance_ptbxl_data(data_path, samples_per_class=3000):
+    metadata = pd.read_csv(os.path.join(data_path, 'ptbxl_database.csv'))
+    scp_statements = pd.read_csv(os.path.join(data_path, 'scp_statements.csv'))
+    
+    diagnostic_scp = scp_statements[scp_statements['diagnostic'] == 1]
+    valid_statements = diagnostic_scp['Unnamed: 0'].values
+    
+    def get_superclass(scp_codes):
+        scp_codes = eval(scp_codes) if isinstance(scp_codes, str) else scp_codes
+        for code, likelihood in scp_codes.items():
+            if code in valid_statements and likelihood > 0:
+                superclass = diagnostic_scp[diagnostic_scp['Unnamed: 0'] == code]['diagnostic_class'].values
+                if len(superclass) > 0:
+                    return superclass[0]
+        return None
+    
+    metadata['superclass'] = metadata['scp_codes'].apply(get_superclass)
+    metadata = metadata[metadata['superclass'].notnull()]
+    
+    label_encoder = LabelEncoder()
+    metadata['label'] = label_encoder.fit_transform(metadata['superclass'])
+    classes = label_encoder.classes_
+    
+    balanced_metadata = pd.DataFrame()
+    for class_name in classes:
+        class_data = metadata[metadata['superclass'] == class_name]
+        if len(class_data) > samples_per_class:
+            class_data = resample(class_data, n_samples=samples_per_class, random_state=42)
+        elif len(class_data) < samples_per_class:
+            class_data = resample(class_data, n_samples=samples_per_class, replace=True, random_state=42)
+        balanced_metadata = pd.concat([balanced_metadata, class_data])
+    
+    balanced_metadata = balanced_metadata.reset_index(drop=True)
+    
+    return balanced_metadata, classes
+
+# Step 3: Data Augmentation
+def augment_signal(signal):
+    noise = np.random.normal(0, 0.03, signal.shape)
+    signal = signal + noise
+    
+    scale = np.random.uniform(0.8, 1.2)
+    signal = signal * scale
+    
+    if np.random.rand() > 0.5:
+        stretch_factor = np.random.uniform(0.85, 1.15)
+        new_length = int(signal.shape[0] * stretch_factor)
+        x = np.linspace(0, signal.shape[0]-1, signal.shape[0])
+        x_new = np.linspace(0, signal.shape[0]-1, new_length)
+        from scipy.interpolate import interp1d
+        signal_new = np.zeros((new_length, signal.shape[1]))
+        for lead in range(signal.shape[1]):
+            interp_func = interp1d(x, signal[:, lead], kind='linear', fill_value="extrapolate")
+            signal_new[:, lead] = interp_func(x_new)
+        signal = signal_new[:signal.shape[0], :]
+    
+    if np.random.rand() > 0.5:
+        t = np.linspace(0, 1, signal.shape[0])
+        wander = 0.05 * np.sin(2 * np.pi * 0.1 * t)
+        signal += wander[:, np.newaxis]
+    
+    return signal
+
+# Step 4: Convert ECG Signals to Graphs with Fixed Wavelet Features
+def ecg_to_graph(signal, label, window_size=500, k=5):
+    signal = (signal - np.mean(signal, axis=0)) / (np.std(signal, axis=0) + 1e-8)
+    
+    if signal.shape[0] < window_size:
+        signal = np.pad(signal, ((0, window_size - signal.shape[0]), (0, 0)), mode='constant')
+    else:
+        signal = signal[:window_size, :]
+    
+    num_nodes = window_size
+    node_features = np.zeros((num_nodes, 19))  # 12 leads + mean + std + 2 FFT + 1 wavelet + 1 R-peak + 1 QRS duration
+    
+    # Precompute wavelet coefficients (single level) and R-peaks
+    wavelet_coeffs = [pywt.wavedec(signal[:, lead], 'db4', level=3)[3] for lead in range(12)]  # Use level 3 only
+    wavelet_features = [np.abs(coeff) for coeff in wavelet_coeffs]
+    peaks_per_lead = [find_peaks(signal[:, lead], distance=50)[0] for lead in range(12)]
+    
+    for t in range(num_nodes):
+        features = signal[t, :]
+        node_features[t, :12] = features
+        node_features[t, 12:14] = [np.mean(signal[t, :]), np.std(signal[t, :])]
+        fft_vals = np.abs(fft(signal[t, :]))[:2]
+        node_features[t, 14:16] = fft_vals / (np.max(fft_vals) + 1e-8)
+        
+        # Single wavelet feature (mean across leads)
+        wavelet_val = np.mean([wf[t] if t < len(wf) else 0.0 for wf in wavelet_features])
+        node_features[t, 16] = wavelet_val
+        
+        r_peak = 1.0 if any(t in peaks for peaks in peaks_per_lead) else 0.0
+        node_features[t, 17] = r_peak
+        qrs_duration = np.mean([np.std(signal[max(0, t-25):min(signal.shape[0], t+25), lead]) for lead in range(12)])
+        node_features[t, 18] = qrs_duration
+    
+    node_features = torch.from_numpy(node_features).float()
+    
+    # Fixed k-nearest neighbor edges (no cosine similarity)
+    edge_index = []
+    for i in range(num_nodes):
+        for j in range(i + 1, min(i + k + 1, num_nodes)):
+            edge_index.append([i, j])
+            edge_index.append([j, i])
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    
+    data = Data(x=node_features, edge_index=edge_index, y=torch.tensor([label], dtype=torch.long))
+    return data
+
+# Step 5: Create Dataset
+def create_dataset(metadata, data_path, window_size=500, k=5, sampling_rate=100, augment=True):
+    graphs = []
+    valid_indices = []
+    for idx, row in tqdm(metadata.iterrows(), total=len(metadata), desc="Creating dataset"):
+        ecg_id = row['ecg_id']
+        label = row['label']
+        file_path = os.path.join(data_path, row['filename_lr'])
+        try:
+            signal, _ = wfdb.rdsamp(file_path.replace('.dat', ''))
+            if augment and np.random.rand() > 0.5:
+                signal = augment_signal(signal)
+            graph = ecg_to_graph(signal, label, window_size, k)
+            graphs.append(graph)
+            valid_indices.append(idx)
+        except Exception as e:
+            print(f"Error processing ECG {ecg_id}: {e}")
+            continue
+    valid_metadata = metadata.loc[valid_indices].reset_index(drop=True)
+    return graphs, valid_metadata
+
+# Step 6: Split Dataset (80/10/10)
+def split_dataset(metadata, graphs):
+    if len(metadata) != len(graphs):
+        raise ValueError(f"Mismatch between metadata ({len(metadata)}) and graphs ({len(graphs)})")
+    
+    train_idx, temp_idx = train_test_split(
+        metadata.index, test_size=0.2, stratify=metadata['label'], random_state=42
+    )
+    val_idx, test_idx = train_test_split(
+        temp_idx, test_size=0.5, stratify=metadata.loc[temp_idx, 'label'], random_state=42
+    )
+    
+    train_graphs = [graphs[i] for i in train_idx]
+    val_graphs = [graphs[i] for i in val_idx]
+    test_graphs = [graphs[i] for i in test_idx]
+    
+    return train_graphs, val_graphs, test_graphs
+
+# Step 7: Enhanced GNN Model with Self-Attention Pooling
+class ECGGNN(nn.Module):
+    def _init(self, input_dim, hidden_dim, num_classes):  # Corrected to __init_
+        super(ECGGNN, self)._init_()
+        self.conv1 = GATConv(input_dim, hidden_dim, heads=8, concat=True)
+        self.conv2 = GATConv(hidden_dim * 8, hidden_dim, heads=8, concat=True)
+        self.pool = SAGPooling(hidden_dim * 8, ratio=0.5)
+        self.conv3 = GATConv(hidden_dim * 8, hidden_dim, heads=4, concat=True)
+        self.conv4 = GATConv(hidden_dim * 4, hidden_dim, heads=1, concat=False)
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.fc2 = nn.Linear(hidden_dim // 2, num_classes)
+        self.dropout = nn.Dropout(0.5)
+        self.norm1 = nn.LayerNorm(hidden_dim * 8)
+        self.norm2 = nn.LayerNorm(hidden_dim * 8)
+        self.norm3 = nn.LayerNorm(hidden_dim * 4)
+    
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = F.relu(self.conv1(x, edge_index))
+        x = self.norm1(x)
+        x = self.dropout(x)
+        x2 = F.relu(self.conv2(x, edge_index))
+        x2 = self.norm2(x2)
+        x2, edge_index, _, batch, _, _ = self.pool(x2, edge_index, None, batch)
+        x3 = F.relu(self.conv3(x2, edge_index))
+        x3 = self.norm3(x3)
+        x3 = self.dropout(x3)
+        x = x3 + x2[:, :x3.size(1)]
+        x = F.relu(self.conv4(x, edge_index))
+        x = global_mean_pool(x, batch)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+# Step 8: Training Loop with Mixed Precision and Loss Logging
+def train_model(model, train_loader, val_loader, device, classes, epochs=100, lr=0.0005, accum_steps=4):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.3, 2.2, 2.2, 1.0, 2.0]).to(device))
+    scaler = GradScaler()
+    best_val_acc = 0
+    patience = 10
+    counter = 0
+    
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
+    
+    for epoch in range(epochs):
+        model.train()
+        total_train_loss = 0
+        correct_train = 0
+        total_train = 0
+        optimizer.zero_grad()
+        
+        for i, data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")):
+            data = data.to(device)
+            with autocast():
+                out = model(data)
+                loss = criterion(out, data.y) / accum_steps
+            scaler.scale(loss).backward()
+            total_train_loss += loss.item() * accum_steps
+            
+            if (i + 1) % accum_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            
+            pred = out.argmax(dim=1)
+            correct_train += (pred == data.y).sum().item()
+            total_train += data.y.size(0)
+        
+        if (i + 1) % accum_steps != 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+        
+        train_loss = total_train_loss / len(train_loader)
+        train_acc = correct_train / total_train
+        train_losses.append(train_loss)
+        train_accs.append(train_acc)
+        
+        model.eval()
+        total_val_loss = 0
+        correct_val = 0
+        total_val = 0
+        with torch.no_grad():
+            for data in val_loader:
+                data = data.to(device)
+                with autocast():
+                    out = model(data)
+                    loss = criterion(out, data.y)
+                total_val_loss += loss.item()
+                pred = out.argmax(dim=1)
+                correct_val += (pred == data.y).sum().item()
+                total_val += data.y.size(0)
+        
+        val_loss = total_val_loss / len(val_loader)
+        val_acc = correct_val / total_val
+        val_losses.append(val_loss)
+        val_accs.append(val_acc)
+        
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
+        
+        scheduler.step()
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            counter = 0
+            torch.save(model.state_dict(), 'best_model.pth')
+        else:
+            counter += 1
+            if counter >= patience or val_acc >= 0.95:
+                if val_acc >= 0.95:
+                    print("Achieved 95%+ validation accuracy. Stopping training.")
+                else:
+                    print("Early stopping triggered.")
+                break
+    
+    return model, best_val_acc, train_losses, val_losses, train_accs, val_accs
+
+# Step 9: Evaluation (Only at the End)
+def evaluate_model(model, loader, device, classes, split_name="Test"):
+    model.eval()
+    preds, trues = [], []
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data in loader:
+            data = data.to(device)
+            with autocast():
+                out = model(data)
+            pred = out.argmax(dim=1)
+            preds.extend(pred.cpu().numpy())
+            trues.extend(data.y.cpu().numpy())
+            correct += (pred == data.y).sum().item()
+            total += data.y.size(0)
+    
+    acc = correct / total
+    
+    print(f"\nClassification Report for {split_name}:")
+    print(classification_report(trues, preds, target_names=classes, digits=4))
+    
+    cm = confusion_matrix(trues, preds)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title(f'Confusion Matrix for {split_name}')
+    plt.show()
+    
+    return acc
+
+# Step 10: Plotting Function for Loss Curves
+def plot_loss_curves(train_losses, val_losses):
+    plt.figure(figsize=(8, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('Loss Curves')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# Step 11: Main Execution
+if _name_ == "_main_":
+    data_path = "/kaggle/input/ptbxl-data/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.1"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print(f"PyTorch Version: {torch._version_}")
+    
+    # Load and balance data
+    metadata, classes = load_and_balance_ptbxl_data(data_path, samples_per_class=3000)
+    print(f"Classes: {classes}")
+    print(f"Balanced dataset size: {len(metadata)}")
+    
+    # Create dataset
+    graphs, metadata = create_dataset(metadata, data_path, window_size=500, augment=True)
+    print(f"Number of graphs created: {len(graphs)}")
+    
+    # Split dataset (80/10/10)
+    train_graphs, val_graphs, test_graphs = split_dataset(metadata, graphs)
+    print(f"Train: {len(train_graphs)}, Val: {len(val_graphs)}, Test: {len(test_graphs)}")
+    
+    # Create data loaders
+    train_loader = DataLoader(train_graphs, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_graphs, batch_size=16)
+    test_loader = DataLoader(test_graphs, batch_size=16)
+    
+    # Clear GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Initialize and train model
+    model = ECGGNN(input_dim=19, hidden_dim=192, num_classes=len(classes)).to(device)
+    model, best_val_acc, train_losses, val_losses, train_accs, val_accs = train_model(
+        model, train_loader, val_loader, device, classes, epochs=100, lr=0.0005, accum_steps=4
+    )
+    
+    # Plot the loss curves
+    plot_loss_curves(train_losses, val_losses)
+    
+    # Load best model
+    model.load_state_dict(torch.load('best_model.pth'))
+    
+    # Final evaluation
+    print("\nFinal Evaluation Results:")
+    val_acc = evaluate_model(model, val_loader, device, classes, split_name="Validation")
+    print(f"Validation Accuracy: {val_acc:.4f}")
+    test_acc = evaluate_model(model, test_loader, device, classes, split_name="Test")
+    print(f"Test Accuracy: {test_acc:.4f}")
